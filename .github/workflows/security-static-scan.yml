@@ -1,0 +1,130 @@
+name: Security static scan
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+# The trusted default-branch workflow reads untrusted PR blobs through the API.
+# Never add checkout, package installation, project execution, or project secrets.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  static-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan immutable source blobs and report on the proposed commit
+        env:
+          SCAN_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, datetime, hashlib, json, os, re, sys, urllib.request
+
+          def api(path, payload=None, method=None):
+              # All endpoints use the fixed GitHub API origin; no URLs come from PR files.
+              req=urllib.request.Request('https://api.github.com/'+path,
+                  data=None if payload is None else json.dumps(payload).encode(),
+                  headers={'Authorization':'Bearer '+os.environ['SCAN_TOKEN'],
+                           'Accept':'application/vnd.github+json',
+                           'X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'},
+                  method=method)
+              with urllib.request.urlopen(req,timeout=60) as response:
+                  return json.load(response)
+
+          MARKER = re.compile(rb"global\s*(?:\[\s*['\"](?:!|_V|\?)['\"]\s*\]|\.i)\s*=\s*['\"](?:[0-9A][^'\"]{0,40})['\"]")
+
+          PACKAGES = [b'tailwindcss-style-animate', b'tailwind-mainanimation', b'tailwind-autoanimation', b'tailwind-animationbased', b'tailwindcss-typography-style', b'tailwindcss-style-modify', b'tailwindcss-animate-style']
+
+          def candidate(path):
+              return bool(re.search(r'\.(?:[cm]?[jt]sx?|json|ya?ml|woff2?|llf|dict|bat|sh|lock)$', path))
+
+          def findings(data,path):
+              found=[]
+              if MARKER.search(data) or (b'rmcej%' + b'otb%') in data or (b'Cot%3t=' + b'shtP') in data:found.append('known obfuscated loader')
+              if data.lstrip().startswith((b'global[',b'global.',b'var _0x',b'const _0x',b'(function(_0x')) and path.endswith(('.woff','.woff2','.llf','.dict')):found.append('JavaScript disguised as an asset')
+              if path.endswith('tasks.json') and b'folderOpen' in data and (re.search(rb'node\s+[^\r\n]+\.(?:woff2?|llf|dict)',data) or re.search(rb'curl[^\r\n]+\|\s*(?:bash|sh|cmd)',data)):found.append('hidden automatic editor launcher')
+              if (b'NONCE_' + b'FANOUT') in data or (b'x-payload-' + b'b64') in data or ((b'AUTH_' + b'API_KEY') in data and ((b'eval(' + b'proxyInfo)') in data or (b'atob' in data and b'eval(' in data))):found.append('secondary remote-code loader')
+              if path.startswith('.github/workflows/') and ((b'216.126.' + b'225.129') in data or re.search((b'Sys' + b'Diag|Mega' + b'lodon'),data,re.I)):found.append('historical malicious workflow indicator')
+              if path.endswith(('temp_auto_push.bat','temp_interactive_push.bat','config.bat')) and (b'--force' in data or b'commit --amend' in data):found.append('automatic propagation script')
+              if path.endswith(('package.json','package-lock.json','pnpm-lock.yaml','yarn.lock')):
+                  for package in PACKAGES:
+                      if package in data:found.append('known malicious dependency: '+package.decode())
+              return found
+
+          def main():
+              event=json.load(open(os.environ['GITHUB_EVENT_PATH']))
+              base_repo=os.environ['GITHUB_REPOSITORY']
+              pr=event.get('pull_request')
+              source_repo=pr['head']['repo']['full_name'] if pr else base_repo
+              head=pr['head']['sha'] if pr else os.environ['GITHUB_SHA']
+              if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',source_repo) or not re.fullmatch(r'[0-9a-f]{40}',head):
+                  raise RuntimeError('Invalid repository or commit identity')
+              check=api('repos/'+base_repo+'/check-runs',{'name':'Security / static malware scan',
+                  'head_sha':head,'status':'in_progress','details_url':'https://github.com/'+base_repo+'/actions/runs/'+os.environ['GITHUB_RUN_ID']},'POST')
+              issues=[];count=0;conclusion='failure';summary='Scan incomplete; merge must remain blocked.'
+              try:
+                  tree=api('repos/'+source_repo+'/git/trees/'+head+'?recursive=1')
+                  if tree.get('truncated'):raise RuntimeError('Tree truncated; complete scan required')
+                  workflow_path='.github/workflows/security-static-scan.yml'
+                  trusted=api('repos/'+base_repo+'/git/trees/'+os.environ['GITHUB_WORKFLOW_SHA']+'?recursive=1')
+                  if trusted.get('truncated'):raise RuntimeError('Trusted tree truncated')
+                  trusted_oid=next(e['sha'] for e in trusted['tree'] if e['path']==workflow_path)
+                  selected=[]; seen={}; workflow_present=False
+                  for entry in tree['tree']:
+                      path=entry['path']
+                      if entry['type']!='blob':continue
+                      if path==workflow_path:
+                          workflow_present=True
+                          if entry['sha']!=trusted_oid:issues.append({'path':path,'reason':'Security workflow differs from trusted default branch; separate security maintenance required'})
+                          continue
+                      if not candidate(path):continue
+                      count+=1
+                      if entry.get('size',0)>20*1024*1024:raise RuntimeError('Candidate exceeds safe scan limit')
+                      selected.append(entry)
+                  unique={e['sha']:e for e in selected}
+                  owner,repository_name=source_repo.split('/')
+                  pending=[];pending_size=0
+                  def verify_blob(sha,data):
+                      actual=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+                      if actual!=sha:raise RuntimeError('Blob integrity mismatch')
+                      seen[sha]=data
+                  def read_batch(entries):
+                      fields=['b'+str(i)+':object(oid:'+json.dumps(e['sha'])+'){...on Blob{oid byteSize text isBinary}}'for i,e in enumerate(entries)]
+                      query='query{repository(owner:'+json.dumps(owner)+',name:'+json.dumps(repository_name)+'){'+''.join(fields)+'}}'
+                      result=api('graphql',{'query':query},'POST')
+                      if result.get('errors'):raise RuntimeError('Blob batch unavailable')
+                      data=result['data']['repository']
+                      for i,e in enumerate(entries):
+                          obj=data['b'+str(i)]
+                          if obj is None:raise RuntimeError('Blob unavailable')
+                          raw=obj['text'].encode() if obj.get('text')is not None else None
+                          if raw is None or hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()!=e['sha']:
+                              exact=api('repos/'+source_repo+'/git/blobs/'+e['sha'])
+                              if exact.get('encoding')!='base64':raise RuntimeError('Unsupported blob encoding')
+                              raw=base64.b64decode(exact['content'])
+                          verify_blob(e['sha'],raw)
+                  for e in unique.values():
+                      if pending and (len(pending)>=40 or pending_size+e.get('size',0)>1024*1024):read_batch(pending);pending=[];pending_size=0
+                      pending.append(e);pending_size+=e.get('size',0)
+                  if pending:read_batch(pending)
+                  for entry in selected:
+                      for hit in findings(seen[entry['sha']],entry['path']):issues.append({'path':entry['path'],'reason':hit})
+                  if not workflow_present:issues.append({'path':workflow_path,'reason':'Required security workflow absent; update branch from clean default branch'})
+                  conclusion='failure' if issues else 'success'
+                  summary=json.dumps({'candidate_files':count,'findings':issues[:50],
+                      'scope':'Known loader signatures only; does not prove arbitrary code safe. No checkout, package install or project code execution.'},ensure_ascii=True,indent=2)
+              except Exception as error:
+                  summary='Static scan incomplete: '+type(error).__name__+'. Merge remains blocked.'
+              api('repos/'+base_repo+'/check-runs/'+str(check['id']),{'status':'completed','conclusion':conclusion,
+                  'completed_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  'output':{'title':'Static source scan '+conclusion,'summary':summary}},'PATCH')
+              print(summary)
+              if conclusion!='success':sys.exit(1)
+
+          if __name__=='__main__':main()
+          PY
